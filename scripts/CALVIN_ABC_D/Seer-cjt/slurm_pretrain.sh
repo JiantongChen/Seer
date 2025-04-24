@@ -1,6 +1,6 @@
 #!/bin/bash
 module load anaconda/2024.02
-conda activate seer
+source activate seer
 
 ### NEED TO CHANGE ###
 calvin_dataset_path="/ailab/group/pjlab-smartbot/share/Official_Manipulation_Data/task_ABCD_D"

@@ -1,6 +1,6 @@
 #!/bin/bash
 module load anaconda/2024.02
-conda activate seer
+source activate seer
 
 export GIT_PYTHON_REFRESH=quiet
 calvin_dataset_path="calvin/dataset/task_ABC_D"
