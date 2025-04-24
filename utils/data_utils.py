@@ -1131,7 +1131,7 @@ def get_calvin_dataset(args, image_processor, tokenizer, epoch=0, floor=False, e
         act_step=args.multi_step_action,
         partial_data=args.partial_data,
         data_in_ceph=args.data_in_ceph,
-        key='except_lang' if except_lang else 'lang',
+        key='except_lang' if except_lang else 'lang', # 'except_lang' if except_lang else 'lang'
     )
     round_fn = math.floor if floor else math.ceil
     num_samples = len(calvin_dataset)
