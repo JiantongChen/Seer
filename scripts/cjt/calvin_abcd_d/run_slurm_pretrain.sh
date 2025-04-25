@@ -9,7 +9,7 @@
 GPUS=8
 
 ### 脚本名称
-RANK_SCRIPT="/ailab/user/chenjiantong/code/Seer/scripts/CALVIN_ABC_D/Seer-cjt/slurm_pretrain.sh"
+RANK_SCRIPT="/ailab/user/chenjiantong/code/Seer/scripts/cjt/calvin_abcd_d/slurm_pretrain.sh"
 
 ### Job Path
 JOB_PATH=`pwd`
