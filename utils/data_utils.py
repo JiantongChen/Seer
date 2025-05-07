@@ -3826,6 +3826,313 @@ def get_bridge_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch, sampler=sampler, dataset=calvin_dataset)
 
 
+class DiskFractalDataset(Dataset):
+    def __init__(
+        self,
+        datasets_dir,
+        image_fn: Callable,
+        text_fn: Callable,
+        dif_ws=False,
+        window_size: int = 16,
+        min_window_size: int = 16,
+        max_window_size: int = 16,
+        act_step=1,
+        pad: bool = True,
+        rgb_pad=-1,
+        gripper_pad=-1,
+        traj_cons=False
+    ):
+        self.window_size = window_size
+        if not dif_ws:
+            self.min_window_size = window_size + act_step - 1
+            self.max_window_size = window_size + act_step - 1
+        else:
+            self.min_window_size = min_window_size
+            self.max_window_size = max_window_size
+
+        self.dataset = LeRobotDataset(datasets_dir)
+        self.episode_lookup = self._build_file_indices()
+
+        self.relative_actions = True
+
+        self.image_fn = image_fn
+        self.text_fn = text_fn
+        self.pad = pad
+        self.traj_cons = traj_cons
+
+        self.rgb_pad = rgb_pad
+        if self.rgb_pad != -1:
+            self.rgb_shift = RandomShiftsAug(rgb_pad)
+
+        self.gripper_pad = gripper_pad
+        if self.gripper_pad != -1:
+            self.gripper_shift = RandomShiftsAug(gripper_pad)
+
+    def _build_file_indices(
+        self,
+    ):
+        episode_lookup = []
+
+        for i in range(self.dataset.num_episodes):
+            start_idx = self.dataset.episode_data_index["from"][i].item()
+            end_idx = self.dataset.episode_data_index["to"][i].item()
+
+            if end_idx - start_idx < self.min_window_size:
+                continue
+            
+            for idx in range(start_idx, end_idx + 1 - self.min_window_size):
+                episode_lookup.append(idx)
+
+        return np.array(episode_lookup)
+    
+    def __len__(self) -> int:
+        return len(self.episode_lookup)
+
+    def __getitem__(self, idx: Union[int, Tuple[int, int]]) -> Dict:
+        if isinstance(idx, int):
+            if self.min_window_size == self.max_window_size:
+                window_size = self.max_window_size
+            else:
+                print(
+                    f"min_window_size {self.min_window_size} != max_window_size {self.max_window_size}"
+                )
+                raise ValueError
+        else:
+            idx, window_size = idx
+        
+        sequence = self._get_sequences(idx, window_size)
+
+        if self.pad:
+            pad_size = self._get_pad_size(sequence)
+            sequence = self._pad_sequence(sequence, pad_size, head=False)
+        
+        new_list = []
+        np_rgb = copy.deepcopy(sequence["rgb_obs"]["image_0"].numpy())
+        for i in range(np_rgb.shape[0]):
+            new_list.append(Image.fromarray(np_rgb[i, :, :, :].astype(np.uint8)))
+        sequence["rgb_obs"]["image_0"] = new_list
+        
+        return sequence
+
+    def _get_sequences(self, idx: int, window_size: int) -> Dict:
+        episode = self._load_episode(idx, window_size)
+
+        seq_state_obs = self._process_state(episode)
+        seq_rgb_obs = self._process_rgb(episode)
+        seq_depth_obs = {"depth_obs": {}}
+        seq_acts = self._process_actions(episode)
+        seq_lang = {"lang": episode["language"]}
+
+        seq_dict = {
+            **seq_state_obs,
+            **seq_rgb_obs,
+            **seq_depth_obs,
+            **seq_acts,
+            **seq_lang
+        }
+        seq_dict["idx"] = idx  
+
+        return seq_dict
+    
+    def _load_episode(self, idx: int, window_size: int) -> Dict[str, np.ndarray]:
+        start_idx = self.episode_lookup[idx]
+        end_idx = start_idx + window_size
+        keys = ['observation.images.image', 'observation.state', 'action']
+        episodes = [self.dataset[idx] for idx in range(start_idx, end_idx)]
+        episode = {key: np.stack([ep[key] for ep in episodes]) for key in keys}
+        episode["language"] = episodes[0]["task"]
+
+        tran_state = []
+        for i in range(len(episode['observation.state'])):
+            state = episode['observation.state'][i]
+            rotation = R.from_quat(state[3:7])
+            euler_angles = rotation.as_euler('xyz', degrees=True)
+            tran_state.append(np.hstack([state[:3], euler_angles, state[-1]]))
+        episode['observation.state'] = np.array(tran_state)
+        
+        return episode
+
+    def _process_state(self, episode: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        state_tensor = torch.from_numpy(episode['observation.state']).float()
+        
+        if len(state_tensor.shape) != 2:
+            state_tensor = state_tensor.unsqueeze(0)
+        assert len(state_tensor.shape) == 2
+
+        return {"robot_obs": state_tensor}
+
+    def _process_rgb(self, episode: Dict[str, np.ndarray]) -> Dict[str, Dict[str, torch.Tensor]]:
+        rgb_obs = torch.from_numpy(episode['observation.images.image']) * 255
+        rgb_obs = rgb_obs.byte().permute(0, 2, 3, 1)
+        seq_rgb_obs_dict = {}
+
+        if len(rgb_obs.shape) != 4:
+            rgb_obs = np.expand_dims(rgb_obs, axis=0)
+        assert len(rgb_obs.shape) == 4
+
+        seq_rgb_obs_dict['image_0'] = rgb_obs
+
+        return {"rgb_obs": seq_rgb_obs_dict}
+    
+    def _process_actions(self, episode: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        seq_acts = torch.from_numpy(episode['action']).float()
+        
+        return {"actions": seq_acts}
+    
+    def _get_pad_size(self, sequence: Dict) -> int:
+        return self.max_window_size - len(sequence["actions"])
+
+    def _pad_sequence(self, seq: Dict, pad_size: int, head: bool=False) -> Dict:
+        seq.update({"robot_obs": self._pad_with_repetition(seq["robot_obs"], pad_size)})
+        seq.update(
+            {
+                "rgb_obs": {
+                    k: self._pad_with_repetition(v, pad_size, head)
+                    for k, v in seq["rgb_obs"].items()
+                }
+            }
+        )
+        seq.update(
+            {
+                "depth_obs": {
+                    k: self._pad_with_repetition(v, pad_size, head)
+                    for k, v in seq["depth_obs"].items()
+                }
+            }
+        )
+
+        if not self.relative_actions:
+            if head:
+                seq_acts = self._pad_with_zeros(seq["actions"], pad_size, head)
+            else:
+                # repeat action for world coordinates action space
+                seq.update({"actions": self._pad_with_repetition(seq["actions"], pad_size, head)})
+        else:
+            # for relative actions zero pad all but the last action dims and repeat last action dim (gripper action)
+            if head:
+                seq_acts = self._pad_with_zeros(seq["actions"], pad_size, head)
+            else:
+                seq_acts = torch.cat(
+                    [
+                        self._pad_with_zeros(seq["actions"][..., :-1], pad_size, head),
+                        self._pad_with_repetition(seq["actions"][..., -1:], pad_size, head),
+                    ],
+                    dim=-1,
+                )
+            seq.update({"actions": seq_acts})
+
+        return seq
+
+    def _pad_with_repetition(self, input_tensor: torch.Tensor, pad_size: int, head: bool = False) -> torch.Tensor:
+        if head:
+            last_repeated = torch.repeat_interleave(
+                torch.unsqueeze(input_tensor[0], dim=0), repeats=pad_size, dim=0
+            )
+            padded = torch.vstack((last_repeated, input_tensor))
+        else:
+            last_repeated = torch.repeat_interleave(
+                torch.unsqueeze(input_tensor[-1], dim=0), repeats=pad_size, dim=0
+            )
+            padded = torch.vstack((input_tensor, last_repeated))
+        return padded
+
+    def _pad_with_zeros(self, input_tensor: torch.Tensor, pad_size: int, head: bool = False) -> torch.Tensor:
+        zeros_repeated = torch.repeat_interleave(
+            torch.unsqueeze(torch.zeros(input_tensor.shape[-1]), dim=0),
+            repeats=pad_size,
+            dim=0,
+        )
+        if head:
+            padded = torch.vstack((zeros_repeated, input_tensor))
+        else:
+            padded = torch.vstack((input_tensor, zeros_repeated))
+        return padded
+    
+    def collator(self, sample):
+        action_tensors = torch.from_numpy(np.array([np.stack(s["actions"]) for s in sample]))
+        state_tensors = torch.from_numpy(np.array([np.stack(s["robot_obs"]) for s in sample]))
+        image_tensors = torch.stack([self.image_fn(s["rgb_obs"]["image_0"]) for s in sample])
+        gripper_tensors = copy.deepcopy(image_tensors)
+        stacked_language = [s["lang"] for s in sample]
+        text_tensors = self.text_fn(stacked_language)
+        
+        if self.rgb_pad != -1:
+            bs, seq_len = image_tensors.shape[:2]
+            if self.traj_cons:
+                image_tensors = self.rgb_shift.forward_traj(image_tensors)
+            else:
+                image_tensors = image_tensors.view(bs*seq_len, *image_tensors.shape[2:])
+                image_tensors = self.rgb_shift(image_tensors)
+                image_tensors = image_tensors.view(bs, seq_len, *image_tensors.shape[1:])
+        if self.gripper_pad != -1:
+            bs, seq_len = gripper_tensors.shape[:2]
+            if self.traj_cons:
+                gripper_tensors = self.gripper_shift.forward_traj(gripper_tensors)
+            else:
+                gripper_tensors = gripper_tensors.view(bs * seq_len, *gripper_tensors.shape[2:])
+                gripper_tensors = self.gripper_shift(gripper_tensors)
+                gripper_tensors = gripper_tensors.view(bs, seq_len, *gripper_tensors.shape[1:])
+        
+        robot_obs = torch.zeros(1)
+        
+        return image_tensors, text_tensors, action_tensors, gripper_tensors, state_tensors, robot_obs
+
+
+def get_fractal_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
+    # ann is dict including language and info
+    shared_epoch = SharedEpoch(epoch=epoch)
+    preprocess_image_fn = functools.partial(
+        preprocess_image, image_processor=image_processor
+    )
+    preprocess_text_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer)
+
+    calvin_dataset = DiskFractalDataset(
+        datasets_dir=args.calvin_dataset,
+        image_fn=preprocess_image_fn,
+        text_fn=preprocess_text_fn,
+        dif_ws=args.dif_ws,
+        window_size=args.window_size,
+        min_window_size=args.min_window_size,
+        max_window_size=args.max_window_size,
+        act_step=args.multi_step_action,
+        rgb_pad=args.rgb_pad,
+        gripper_pad=args.gripper_pad,
+        traj_cons=args.traj_cons
+    )
+    round_fn = math.floor if floor else math.ceil
+    num_samples = len(calvin_dataset)
+    global_batch_size = args.batch_size * args.world_size
+    num_batches = round_fn(num_samples / global_batch_size)
+    num_workers = max(1, args.workers)
+    num_worker_batches = round_fn(num_batches / num_workers)  #
+    num_batches = num_worker_batches * num_workers
+    num_samples = num_batches * global_batch_size
+
+    sampler = DistributedSampler(
+        calvin_dataset,
+        num_replicas=args.world_size,
+        rank=args.rank,
+        shuffle=True,
+        seed=args.seed,
+        drop_last=True,
+    )
+    dataloader = DataLoader(
+        calvin_dataset,
+        batch_size=args.batch_size,
+        pin_memory=False,
+        num_workers=num_workers,
+        prefetch_factor=3,
+        sampler=sampler,
+        persistent_workers=True,
+        collate_fn=calvin_dataset.collator,
+        drop_last=True
+    )
+    dataloader.num_batches = num_batches
+    dataloader.num_samples = num_samples
+
+    return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch, sampler=sampler, dataset=calvin_dataset)
+
+
 if __name__ == "__main__":
     from arguments_utils import get_args_and_cfg
     from tqdm import tqdm
