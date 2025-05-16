@@ -3946,7 +3946,7 @@ class DiskFractalDataset(Dataset):
         for i in range(len(episode['observation.state'])):
             state = episode['observation.state'][i]
             rotation = R.from_quat(state[3:7])
-            euler_angles = rotation.as_euler('xyz', degrees=True)
+            euler_angles = rotation.as_euler('xyz', degrees=False)
             tran_state.append(np.hstack([state[:3], euler_angles, state[-1]]))
         episode['observation.state'] = np.array(tran_state)
         
